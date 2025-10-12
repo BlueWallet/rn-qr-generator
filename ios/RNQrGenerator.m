@@ -8,6 +8,7 @@
 #import "React/RCTConvert.h"   // Required when used as a Pod in a Swift project
 #endif
 
+#import <UIKit/UIKit.h>
 #import <ZXingObjC/ZXingObjC.h>
 
 @implementation RNQrGenerator
@@ -128,19 +129,52 @@ RCT_EXPORT_METHOD(detect:(NSDictionary *)options
       RCTLogWarn(@"key 'uri' or 'base64' are missing in options");
       return;
   }
-    ZXLuminanceSource *source = [[ZXCGImageLuminanceSource alloc] initWithCGImage:image.CGImage];
-    ZXBinaryBitmap *bitmap = [ZXBinaryBitmap binaryBitmapWithBinarizer:[ZXHybridBinarizer binarizerWithSource:source]];
-
-    NSError *error = nil;
-
-    // There are a number of hints we can give to the reader, including
-    // possible formats, allowed lengths, and the string encoding.
-
-    ZXMultiFormatReader *reader = [ZXMultiFormatReader reader];
     ZXDecodeHints *hints = [self createDecodeHints];
-    ZXResult *result = [reader decode:bitmap
-                                hints:hints
-                                error:&error];
+    ZXResult *result = [self decodeImage:image hints:hints];
+
+    if (!result) {
+        NSArray<NSValue *> *relativeInsets = @[
+            [NSValue valueWithUIEdgeInsets:UIEdgeInsetsMake(0.15f, 0.05f, 0.35f, 0.05f)],
+            [NSValue valueWithUIEdgeInsets:UIEdgeInsetsMake(0.25f, 0.05f, 0.25f, 0.05f)],
+            [NSValue valueWithUIEdgeInsets:UIEdgeInsetsMake(0.35f, 0.05f, 0.15f, 0.05f)]
+        ];
+
+        NSArray<NSNumber *> *zoomFactors = @[@1.2f, @1.5f, @2.0f];
+        BOOL didDecode = NO;
+
+        for (NSValue *value in relativeInsets) {
+            if (didDecode) {
+                break;
+            }
+            UIEdgeInsets insets = [value UIEdgeInsetsValue];
+            UIImage *croppedImage = [self cropImage:image withRelativeInsets:insets];
+            if (!croppedImage) {
+                continue;
+            }
+
+            result = [self decodeImage:croppedImage hints:hints];
+            if (result) {
+                didDecode = YES;
+                break;
+            }
+
+            for (NSNumber *factor in zoomFactors) {
+                if (didDecode) {
+                    break;
+                }
+                CGFloat zoomFactor = [factor floatValue];
+                if (zoomFactor <= 1.0f) {
+                    continue;
+                }
+                UIImage *zoomedImage = [self scaleImage:croppedImage byFactor:zoomFactor];
+                result = [self decodeImage:zoomedImage hints:hints];
+                if (result) {
+                    didDecode = YES;
+                }
+            }
+        }
+    }
+
     NSMutableDictionary *response = [[NSMutableDictionary alloc] init];
     if (result) {
       // The coded result as a string. The raw data can be accessed with
@@ -178,13 +212,105 @@ RCT_EXPORT_METHOD(detect:(NSDictionary *)options
           response[@"type"] = @"QRCode";
           successCallback(@[response]);
       } else {
-          NSString *errorMessage = @"QRCode iOS 8+ required";
-          NSDictionary *userInfo = @{NSLocalizedFailureReasonErrorKey: NSLocalizedString(errorMessage, nil)};
-          NSError *error = [NSError errorWithDomain:@"com.rnqrcode" code:1 userInfo:userInfo];
-          failureCallback(error);
-          RCTLogWarn(@"Required iOS 8 or later");
+            NSString *errorMessage = @"QRCode iOS 8+ required";
+            NSDictionary *userInfo = @{NSLocalizedFailureReasonErrorKey: NSLocalizedString(errorMessage, nil)};
+            NSError *error = [NSError errorWithDomain:@"com.rnqrcode" code:1 userInfo:userInfo];
+            failureCallback(error);
+            RCTLogWarn(@"Required iOS 8 or later");
       }
     }
+}
+
+- (NSString *)generatePathInDirectory:(NSString *)directory fileName:(NSString *)name withExtension:(NSString *)extension
+{
+    NSString *fileName = name ? name : [[NSUUID UUID] UUIDString];
+    fileName = [fileName stringByAppendingString:extension];
+    [self ensureDirExistsWithPath:directory];
+    return [directory stringByAppendingPathComponent:fileName];
+}
+
+- (UIImage *)imageFromPath:(NSString *)path
+{
+    NSURL *imageURL = [NSURL URLWithString:path];
+    NSData *imageData = [NSData dataWithContentsOfURL:imageURL];
+    return [UIImage imageWithData:imageData];
+}
+
+- (UIImage *)imageFromBase64:(NSString *)base64String
+{
+    NSData *imageData = [[NSData alloc]initWithBase64EncodedString:base64String options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    return [UIImage imageWithData:imageData];
+}
+
+- (ZXResult *)decodeImage:(UIImage *)image hints:(ZXDecodeHints *)hints
+{
+    if (!image || !image.CGImage) {
+        return nil;
+    }
+
+    ZXResult *result = nil;
+    NSError *error = nil;
+    ZXCGImageLuminanceSource *source = [[ZXCGImageLuminanceSource alloc] initWithCGImage:image.CGImage];
+    ZXBinaryBitmap *hybridBitmap = [ZXBinaryBitmap binaryBitmapWithBinarizer:[ZXHybridBinarizer binarizerWithSource:source]];
+    ZXMultiFormatReader *reader = [ZXMultiFormatReader reader];
+
+    @try {
+        result = [reader decode:hybridBitmap hints:hints error:&error];
+    } @catch (NSException *exception) {
+        result = nil;
+    }
+
+    [reader reset];
+    return result;
+}
+
+- (UIImage *)cropImage:(UIImage *)image withRelativeInsets:(UIEdgeInsets)insets
+{
+    if (!image || !image.CGImage) {
+        return nil;
+    }
+    if (insets.top + insets.bottom >= 1.0f || insets.left + insets.right >= 1.0f) {
+        return nil;
+    }
+
+    CGFloat scale = image.scale;
+    CGFloat pixelWidth = image.size.width * scale;
+    CGFloat pixelHeight = image.size.height * scale;
+
+    CGRect cropRect = CGRectMake(insets.left * pixelWidth,
+                                 insets.top * pixelHeight,
+                                 pixelWidth * (1.0f - insets.left - insets.right),
+                                 pixelHeight * (1.0f - insets.top - insets.bottom));
+    cropRect = CGRectIntersection(CGRectMake(0, 0, pixelWidth, pixelHeight), cropRect);
+    cropRect = CGRectIntegral(cropRect);
+
+    if (CGRectIsEmpty(cropRect) || cropRect.size.width <= 0 || cropRect.size.height <= 0) {
+        return nil;
+    }
+
+    CGImageRef croppedRef = CGImageCreateWithImageInRect(image.CGImage, cropRect);
+    if (!croppedRef) {
+        return nil;
+    }
+
+    UIImage *croppedImage = [UIImage imageWithCGImage:croppedRef scale:image.scale orientation:image.imageOrientation];
+    CGImageRelease(croppedRef);
+    return croppedImage;
+}
+
+- (UIImage *)scaleImage:(UIImage *)image byFactor:(CGFloat)factor
+{
+    if (!image || factor <= 1.0f) {
+        return image;
+    }
+
+    CGSize newSize = CGSizeMake(image.size.width * factor, image.size.height * factor);
+    UIGraphicsBeginImageContextWithOptions(newSize, NO, image.scale);
+    [image drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
+    UIImage *scaledImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    return scaledImage ?: image;
 }
 
 - (ZXDecodeHints *)createDecodeHints {
@@ -210,27 +336,6 @@ RCT_EXPORT_METHOD(detect:(NSDictionary *)options
     [hints addPossibleFormat:kBarcodeFormatUPCEANExtension];
 
     return hints;
-}
-
-- (NSString *)generatePathInDirectory:(NSString *)directory fileName:(NSString *)name withExtension:(NSString *)extension
-{
-    NSString *fileName = name ? name : [[NSUUID UUID] UUIDString];
-    fileName = [fileName stringByAppendingString:extension];
-    [self ensureDirExistsWithPath:directory];
-    return [directory stringByAppendingPathComponent:fileName];
-}
-
-- (UIImage *)imageFromPath:(NSString *)path
-{
-    NSURL *imageURL = [NSURL URLWithString:path];
-    NSData *imageData = [NSData dataWithContentsOfURL:imageURL];
-    return [UIImage imageWithData:imageData];
-}
-
-- (UIImage *)imageFromBase64:(NSString *)base64String
-{
-    NSData *imageData = [[NSData alloc]initWithBase64EncodedString:base64String options:NSDataBase64DecodingIgnoreUnknownCharacters];
-    return [UIImage imageWithData:imageData];
 }
 
 - (NSString*) getCodeType:(ZXBarcodeFormat) format {
