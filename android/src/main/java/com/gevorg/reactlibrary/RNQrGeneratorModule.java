@@ -309,33 +309,125 @@ public class RNQrGeneratorModule extends ReactContextBaseJavaModule {
   }
 
   public static Result[] scanBitmap(Bitmap bMap) throws Exception {
-    int[] intArray = new int[bMap.getWidth() * bMap.getHeight()];
-    //copy pixel data from the Bitmap into the 'intArray' array
-    bMap.getPixels(intArray, 0, bMap.getWidth(), 0, 0, bMap.getWidth(), bMap.getHeight());
-
-    LuminanceSource source = new RGBLuminanceSource(bMap.getWidth(), bMap.getHeight(), intArray);
-    BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
-
-    Reader reader = new MultiFormatReader();
-    QRCodeMultiReader readerMulti = new QRCodeMultiReader();
-
-    Map<DecodeHintType, Object> hints = new HashMap();
+    Map<DecodeHintType, Object> hints = new HashMap<DecodeHintType, Object>();
     hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
 
+    Exception lastError = null;
+
+    try {
+      return decodeBitmapUsingBinarizers(bMap, hints);
+    } catch (Exception e) {
+      lastError = e;
+      Log.e("RNQRGenerator", "Decode failed on original bitmap", e);
+    }
+
+    float[][] cropConfigs = new float[][]{
+      {0.15f, 0.05f, 0.35f, 0.05f},
+      {0.25f, 0.05f, 0.25f, 0.05f},
+      {0.35f, 0.05f, 0.15f, 0.05f}
+    };
+    float[] zoomFactors = new float[]{1.2f, 1.5f, 2.0f};
+
+    for (float[] config : cropConfigs) {
+      Bitmap cropped = cropBitmapRelative(bMap, config[0], config[1], config[2], config[3]);
+      if (cropped == null) {
+        continue;
+      }
+      try {
+        return decodeBitmapUsingBinarizers(cropped, hints);
+      } catch (Exception cropError) {
+        lastError = cropError;
+        Log.e("RNQRGenerator", "Decode failed on cropped bitmap", cropError);
+      }
+
+      for (float zoom : zoomFactors) {
+        if (zoom <= 1.0f) {
+          continue;
+        }
+        Bitmap zoomed = scaleBitmapByFactor(cropped, zoom);
+        if (zoomed == null) {
+          continue;
+        }
+        try {
+          return decodeBitmapUsingBinarizers(zoomed, hints);
+        } catch (Exception zoomError) {
+          lastError = zoomError;
+          Log.e("RNQRGenerator", "Decode failed on zoomed bitmap", zoomError);
+        }
+      }
+    }
+
+    if (lastError != null) {
+      throw lastError;
+    }
+    throw new Exception("Decode failed");
+  }
+
+  private static Result[] decodeBitmapUsingBinarizers(Bitmap bitmap, Map<DecodeHintType, Object> hints) throws Exception {
+    LuminanceSource source = createLuminanceSource(bitmap);
+    BinaryBitmap hybridBitmap = new BinaryBitmap(new HybridBinarizer(source));
+    return decodeBinaryBitmap(new MultiFormatReader(), new QRCodeMultiReader(), hybridBitmap, hints);
+  }
+
+  private static Result[] decodeBinaryBitmap(Reader reader, QRCodeMultiReader readerMulti, BinaryBitmap bitmap, Map<DecodeHintType, Object> hints) throws Exception {
     try {
       Result result = reader.decode(bitmap, hints);
-      Result[] results;
-      if (result.getText() != "") {
-        results = new Result[1];
+      if (!result.getText().isEmpty()) {
+        Result[] results = new Result[1];
         results[0] = result;
-      } else {
-        results = readerMulti.decodeMultiple(bitmap, hints);
+        return results;
       }
+      Result[] results = readerMulti.decodeMultiple(bitmap, hints);
       return results;
     } catch (Exception e) {
       Log.e("RNQRGenerator", "Decode Failed:", e);
       throw e;
+    } finally {
+      reader.reset();
+      readerMulti.reset();
     }
+  }
+
+  private static LuminanceSource createLuminanceSource(Bitmap bitmap) {
+    int width = bitmap.getWidth();
+    int height = bitmap.getHeight();
+    int[] pixels = new int[width * height];
+    bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
+    return new RGBLuminanceSource(width, height, pixels);
+  }
+
+  private static Bitmap cropBitmapRelative(Bitmap bitmap, float topInset, float leftInset, float bottomInset, float rightInset) {
+    if (bitmap == null) {
+      return null;
+    }
+    if (topInset + bottomInset >= 1.0f || leftInset + rightInset >= 1.0f) {
+      return null;
+    }
+    int width = bitmap.getWidth();
+    int height = bitmap.getHeight();
+
+    int left = Math.max(0, Math.round(leftInset * width));
+    int top = Math.max(0, Math.round(topInset * height));
+    int right = Math.max(0, Math.round(rightInset * width));
+    int bottom = Math.max(0, Math.round(bottomInset * height));
+
+    int cropWidth = width - left - right;
+    int cropHeight = height - top - bottom;
+
+    if (cropWidth <= 0 || cropHeight <= 0) {
+      return null;
+    }
+
+    return Bitmap.createBitmap(bitmap, left, top, cropWidth, cropHeight);
+  }
+
+  private static Bitmap scaleBitmapByFactor(Bitmap bitmap, float factor) {
+    if (bitmap == null || factor <= 1.0f) {
+      return bitmap;
+    }
+    int width = Math.max(1, Math.round(bitmap.getWidth() * factor));
+    int height = Math.max(1, Math.round(bitmap.getHeight() * factor));
+    return Bitmap.createScaledBitmap(bitmap, width, height, true);
   }
 
 
